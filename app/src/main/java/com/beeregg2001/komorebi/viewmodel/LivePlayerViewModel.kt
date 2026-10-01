@@ -89,6 +89,15 @@ class LivePlayerViewModel @Inject constructor(
     companion object {
         private const val TAG = "LivePlayerViewModel"
         private const val MAX_AUTO_RETRY = 2
+
+        // ★ 追加: KonomiTV がライブストリームを再起動 (Restart) したあと、繋ぎ直すまでの待ち時間。
+        // KonomiTV は Restart に移行した直後に視聴中の全クライアントを切断する (LiveStream.disconnectAll())。
+        // 切断より先に繋ぎ直すと新しい接続まで切られてしまうため、KonomiTV 公式クライアント
+        // (PlayerController の PlayerRestartRequired) と同じく 0.5 秒待ってから繋ぎ直す
+        private const val KONOMI_RESTART_RECONNECT_DELAY_MS = 500L
+
+        // ★ 追加: ONAir に戻らないまま Restart が続いた場合に、繋ぎ直しを打ち切る回数
+        private const val MAX_KONOMI_RESTART_RECONNECT = 5
     }
 
     private val gson = Gson()
@@ -217,6 +226,16 @@ class LivePlayerViewModel @Inject constructor(
     private var dualCurrentChannel: Channel? = null
     private var dualCurrentQuality: StreamQuality? = null
     private var dualAutoRetryCount = 0
+
+    // ★ 追加: KonomiTV のライブストリーム再起動 (Restart) に追従して繋ぎ直すための状態。
+    // LastKonomiStatus は現在の SSE 接続で最後に受け取ったステータス (Restart の取りこぼし検知用)、
+    // KonomiRestartJob は待機中の再接続、KonomiRestartCount は ONAir に戻らないまま繋ぎ直した回数
+    private var mainLastKonomiStatus: String? = null
+    private var mainKonomiRestartJob: Job? = null
+    private var mainKonomiRestartCount = 0
+    private var dualLastKonomiStatus: String? = null
+    private var dualKonomiRestartJob: Job? = null
+    private var dualKonomiRestartCount = 0
 
     init {
         viewModelScope.launch {
@@ -472,6 +491,8 @@ class LivePlayerViewModel @Inject constructor(
     fun releasePlayers() {
         recordSyncEngine.setThrottled(false)
         mainPlaybackJob?.cancel(); dualPlaybackJob?.cancel()
+        // ★ 追加: 画面を離れた後に、待機中だった再接続で再生が勝手に再開されないようにする
+        mainKonomiRestartJob?.cancel(); dualKonomiRestartJob?.cancel()
         mainEventSource?.cancel(); dualEventSource?.cancel()
 
         // ★ 修正: release()の前に必ずstop()とclearMediaItems()を呼んでゾンビ化を防ぐ
@@ -663,6 +684,9 @@ class LivePlayerViewModel @Inject constructor(
         recordSyncEngine.setThrottled(true)
         if (!isAutoRetry) {
             mainAutoRetryCount = 0; _mainPlayerError.value = null
+            // ★ 追加: 手動でチャンネル・画質を切り替えたら、前のチャンネルの再接続待ちは破棄する
+            mainKonomiRestartJob?.cancel(); mainKonomiRestartJob = null
+            mainKonomiRestartCount = 0
         }
         mainCurrentChannel = channel; mainCurrentSource = source; mainIsEdcbDirect =
             isEdcbDirect; mainCurrentQuality = quality
@@ -782,7 +806,12 @@ class LivePlayerViewModel @Inject constructor(
         if (channel.displayChannelId.isBlank() || channel.displayChannelId == "null") return
         if (dualCurrentChannel?.id != channel.id) setDualSubtitleLanguage(1)
         recordSyncEngine.setThrottled(true)
-        if (!isAutoRetry) dualAutoRetryCount = 0
+        if (!isAutoRetry) {
+            dualAutoRetryCount = 0
+            // ★ 追加: メイン側と同じく、手動切り替え時は前のチャンネルの再接続待ちを破棄する
+            dualKonomiRestartJob?.cancel(); dualKonomiRestartJob = null
+            dualKonomiRestartCount = 0
+        }
         dualCurrentChannel = channel; dualCurrentSource = source; dualIsEdcbDirect =
             isEdcbDirect; dualCurrentQuality = quality
 
@@ -896,6 +925,7 @@ class LivePlayerViewModel @Inject constructor(
 
     fun stopAllPlayers() {
         mainPlaybackJob?.cancel(); dualPlaybackJob?.cancel()
+        mainKonomiRestartJob?.cancel(); dualKonomiRestartJob?.cancel()
         viewModelScope.launch {
             mainPlaybackMutex.withLock { stopMainPlaybackSafely() }
             dualPlaybackMutex.withLock { stopDualPlaybackSafely() }
@@ -904,6 +934,7 @@ class LivePlayerViewModel @Inject constructor(
 
     fun stopDualPlayer() {
         dualPlaybackJob?.cancel()
+        dualKonomiRestartJob?.cancel()
         viewModelScope.launch { dualPlaybackMutex.withLock { stopDualPlaybackSafely() } }
     }
 
@@ -1182,6 +1213,8 @@ class LivePlayerViewModel @Inject constructor(
         config: BackendConfig.KonomiTv,
         cfAccessHeaders: Map<String, String> = emptyMap()
     ) {
+        // ★ 追加: 新しい SSE 接続では、直前のステータスを持ち越さない
+        mainLastKonomiStatus = null
         val eventUrl =
             UrlBuilder.getKonomiTvLiveEventsUrl(config.ip, config.port, channelId, quality)
         val request =
@@ -1227,6 +1260,11 @@ class LivePlayerViewModel @Inject constructor(
                             val json = JSONObject(data)
                             val status = json.optString("status", "Unknown")
                             val detail = json.optString("detail", AppStrings.STATUS_LOADING)
+                            // ★ 追加: チャンネル切り替え前の古い SSE 接続から遅れて届いたイベントは、
+                            // 再起動の判定に使わない
+                            val isCurrentSource = eventSource === mainEventSource
+                            val previousStatus = mainLastKonomiStatus
+                            if (isCurrentSource) mainLastKonomiStatus = status
                             _mainSseStatus.value = status
                             _mainSseDetail.value = if (detail.contains("OnAirです")) "" else detail
                             if (status == "Error" || (status == "Offline" && (detail.contains("失敗") || detail.contains(
@@ -1242,6 +1280,21 @@ class LivePlayerViewModel @Inject constructor(
                                     )
                                 )
                                 return@launch
+                            }
+                            // ★ 追加: KonomiTV がエンコードタスクを再起動したら繋ぎ直す。
+                            // KonomiTV は再起動時に視聴中の全クライアントを切断し、新しいエンコードタスクへ
+                            // 改めて接続してもらう前提になっている (公式クライアントはプレイヤーを作り直す)。
+                            // 以前は pause() するだけで接続し直さなかったため、誰も繋いでいない状態が
+                            // max_alive_time (既定 10 秒) 続いてライブストリームが Offline になり、
+                            // チャンネルを選び直すまで復帰しなかった。
+                            // Restart は 0.2 秒ほどで Standby に移るため SSE (0.05 秒間隔の監視) で
+                            // 取りこぼす可能性がある。KonomiTV が ONAir から Standby に戻すのは新しい
+                            // エンコードタスクが始まったときだけなので、それも再起動とみなす
+                            if (isCurrentSource) {
+                                if (status == "ONAir") mainKonomiRestartCount = 0
+                                if (status == "Restart" || (status == "Standby" && previousStatus == "ONAir")) {
+                                    scheduleMainKonomiReconnect(uiContext)
+                                }
                             }
                             when (status) {
                                 "Standby", "Restart" -> _mainPlayer.value?.pause()
@@ -1267,6 +1320,8 @@ class LivePlayerViewModel @Inject constructor(
         config: BackendConfig.KonomiTv,
         cfAccessHeaders: Map<String, String> = emptyMap()
     ) {
+        // ★ 追加: メイン側と同じく、新しい SSE 接続では直前のステータスを持ち越さない
+        dualLastKonomiStatus = null
         val eventUrl =
             UrlBuilder.getKonomiTvLiveEventsUrl(config.ip, config.port, channelId, quality)
         val request =
@@ -1306,6 +1361,10 @@ class LivePlayerViewModel @Inject constructor(
                         try {
                             val json = JSONObject(data)
                             val status = json.optString("status", "Unknown")
+                            // ★ 追加: メイン側と同じ理由で、古い SSE 接続のイベントは再起動の判定に使わない
+                            val isCurrentSource = eventSource === dualEventSource
+                            val previousStatus = dualLastKonomiStatus
+                            if (isCurrentSource) dualLastKonomiStatus = status
                             _dualSseStatus.value = status
                             _dualSseDetail.value =
                                 json.optString("detail", AppStrings.STATUS_LOADING)
@@ -1323,6 +1382,13 @@ class LivePlayerViewModel @Inject constructor(
                                 )
                                 return@launch
                             }
+                            // ★ 追加: KonomiTV がエンコードタスクを再起動したら繋ぎ直す (理由はメイン側のコメント参照)
+                            if (isCurrentSource) {
+                                if (status == "ONAir") dualKonomiRestartCount = 0
+                                if (status == "Restart" || (status == "Standby" && previousStatus == "ONAir")) {
+                                    scheduleDualKonomiReconnect(uiContext)
+                                }
+                            }
                             when (status) {
                                 "Standby", "Restart" -> _dualPlayer.value?.pause()
                                 "ONAir" -> {
@@ -1336,6 +1402,53 @@ class LivePlayerViewModel @Inject constructor(
                     }
                 }
             })
+    }
+
+    /**
+     * KonomiTV のライブストリーム再起動 (Restart) を検知したときに、少し待ってからメイン側を繋ぎ直す。
+     * 繋ぎ直しはチャンネルを選び直したときと同じ [playMainChannel] で行う (エラー時の自動再試行と同じ経路)。
+     */
+    private fun scheduleMainKonomiReconnect(uiContext: Context) {
+        // Restart と Standby が続けて届くなど、すでに再接続を待っている場合は重ねない
+        if (mainKonomiRestartJob?.isActive == true) return
+        val channel = mainCurrentChannel ?: return
+        val quality = mainCurrentQuality ?: return
+        if (mainKonomiRestartCount >= MAX_KONOMI_RESTART_RECONNECT) {
+            Log.w(TAG, "KonomiTV live stream kept restarting without reaching ONAir. Stop reconnecting main player.")
+            return
+        }
+        mainKonomiRestartCount++
+        val source = mainCurrentSource
+        val isEdcbDirect = mainIsEdcbDirect
+        mainKonomiRestartJob = viewModelScope.launch {
+            delay(KONOMI_RESTART_RECONNECT_DELAY_MS)
+            // 待っている間にチャンネルや画質が切り替わっていたら、古いチャンネルへ繋ぎ直さない
+            if (mainCurrentChannel?.id != channel.id || mainCurrentQuality?.value != quality.value) return@launch
+            Log.i(TAG, "KonomiTV live stream restarted. Reconnecting main player... ($mainKonomiRestartCount/$MAX_KONOMI_RESTART_RECONNECT)")
+            playMainChannel(uiContext, channel, source, isEdcbDirect, quality, isAutoRetry = true)
+        }
+    }
+
+    /**
+     * [scheduleMainKonomiReconnect] のサブ画面版。
+     */
+    private fun scheduleDualKonomiReconnect(uiContext: Context) {
+        if (dualKonomiRestartJob?.isActive == true) return
+        val channel = dualCurrentChannel ?: return
+        val quality = dualCurrentQuality ?: return
+        if (dualKonomiRestartCount >= MAX_KONOMI_RESTART_RECONNECT) {
+            Log.w(TAG, "KonomiTV live stream kept restarting without reaching ONAir. Stop reconnecting dual player.")
+            return
+        }
+        dualKonomiRestartCount++
+        val source = dualCurrentSource
+        val isEdcbDirect = dualIsEdcbDirect
+        dualKonomiRestartJob = viewModelScope.launch {
+            delay(KONOMI_RESTART_RECONNECT_DELAY_MS)
+            if (dualCurrentChannel?.id != channel.id || dualCurrentQuality?.value != quality.value) return@launch
+            Log.i(TAG, "KonomiTV live stream restarted. Reconnecting dual player... ($dualKonomiRestartCount/$MAX_KONOMI_RESTART_RECONNECT)")
+            playDualChannel(uiContext, channel, source, isEdcbDirect, quality, isAutoRetry = true)
+        }
     }
 
     /**
